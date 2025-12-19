@@ -132,5 +132,34 @@ eBPF程序运行期间`get_page_from_freelist`共返回了89551次`NULL`
 5. 触发 OOM ，再次尝试分配。
 6. 分配页面失败。
 
+#### 4. 另一种方法
+
+​	注意到，在内核中，对`get_page_from_freelist`的调用分布在：
+
+``` 
+mm/page_alloc.c
+
+
+__alloc_pages()
+    |-- get_page_from_freelist()
+    |-- __alloc_pages_slowpath
+        |-- get_page_from_freelist()
+        |-- get_page_from_freelist()
+        |-- __alloc_pages_cpuset_fallback()
+            |-- get_page_from_freelist()
+            |-- get_page_from_freelist()
+    	|-- __alloc_pages_may_oom()
+            |-- get_page_from_freelist()
+            |-- __alloc_pages_cpuset_fallback()
+                |-- get_page_from_freelist()
+                |-- get_page_from_freelist()
+		|-- __alloc_pages_direct_compact()
+            |-- get_page_from_freelist()
+        |-- __alloc_pages_direct_compact()
+            |-- get_page_from_freelist()
+        |-- __alloc_pages_direct_reclaim()
+            |-- get_page_from_freelist()
+```
+
 
 
