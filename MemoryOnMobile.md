@@ -1,69 +1,112 @@
-## 文献综述：Acclaim——面向 Android 系统的自适应内存回收机制
+#### 0. 前提
 
-### 1. 研究背景与核心问题
+​	经过**root**的安卓设备。
 
-​	Linux 内核的内存回收机制（Memory Reclaim Scheme）最初是为服务器和桌面环境设计的，旨在处理高吞吐量的工作负载 。然而，Android 设备继承了这一机制，却面临着截然不同的工作负载特性 。
+#### 1. 环境可行性验证
 
-​	论文指出，直接将 Linux 的回收策略应用于移动设备会导致严重的性能瓶颈，主要体现在两个方面：
+**操作：** 通过 ADB 检查设备内核是否暴露了 BTF 信息文件。
 
-1. **页面重错误 (Page Re-fault):** 即已被驱逐（Evicted）的页面在短时间内又被重新请求 。这导致系统必须从存储设备（Flash Storage）读取数据，延迟比从内存读取高出 100 倍以上 。
-2. **直接回收 (Direct Reclaim):** 当后台回收（kswapd）来不及释放足够页面时，分配请求会触发同步的直接回收 。这会阻塞当前的内存分配进程，甚至需要同步刷新脏页，造成严重的卡顿 。
+```bash
+adb shell su -c "ls -l /sys/kernel/btf/vmlinux"
+```
 
-### 2. 深度分析：为何 Android 内存管理效率低下？
+**结果：**
 
-作者通过在真实设备上的监控和实验，总结出导致上述问题的四大核心观察（Observations）：
+- **输出**：`-r--r--r-- 1 root root 5785743 ... /sys/kernel/btf/vmlinux`
+- **结论**：文件存在且大小正常。
+- **意义**：
+  - 说明该 Android 设备的内核在编译时开启了 `CONFIG_DEBUG_INFO_BTF=y`。
+  - `/sys/kernel/btf/vmlinux` 包含了该内核中所有数据结构、函数签名和类型定义。
+  - **判定**：可以使用现代化 eBPF (CO-RE) 开发模式，无需下载内核源码。
 
-- **观察 1：页面重错误与可用内存强相关。** 内存越少，背景应用越多，页面重错误率越高 。
-- **观察 2：直接回收取决于后台回收的延迟。** 如果后台回收（Background Reclaim）太慢或力度不够，就会被迫触发昂贵的直接回收 。
-- **观察 3：后台应用抢占前台资源。**
-  - Android 的 LRU 算法通常根据访问频率和时间来驱逐页面，而不区分应用是前台还是后台 。
-  - 后台应用的匿名页（Anonymous pages）通常比前台应用的文件页（File pages）更难被驱逐，导致后台应用持续占用内存，迫使前台页被驱逐，引发重错误 。
-- **观察 4：回收粒度过大（Large-size reclaim）不适合移动端。**
-  - Linux 倾向于一次回收较大的连续内存块（为了减少碎片和服务大分配），这适合服务器 。
-  - 但 Android 应用（如 SQLite）通常请求极小的内存块（4KB，Order 0） 。
-  - 过于激进的大粒度回收不仅增加了后台回收的延迟，还误杀了本不该被驱逐的页面 。
+#### 2. 提取 BTF 文件
 
-### 3. 解决方案：Acclaim 系统
+1. **复制到临时目录**： 直接 `adb pull` 系统目录通常会因为权限不足失败，所以先用 Root 权限将其复制到可读写的临时目录 `/data/local/tmp`。
 
-针对上述问题，论文提出了 **Acclaim**，一个包含两个核心组件的自适应回收方案：
+   ```bash
+   adb shell "su -c 'cp /sys/kernel/btf/vmlinux /data/local/tmp/vmlinux.btf'"
+   ```
 
-#### A. 前台感知驱逐 (Foreground Aware Eviction, FAE)
+2. **修改权限**： 确保该副本文件是可读的。
 
-- **目标：** 解决后台应用“窃取”前台资源的问题 。
-- **机制：**
-  - 利用页表项（PTE）中未使用的位来标记页面所属应用的 UID 。
-  - 在 LRU 链表操作中，**主动降低后台应用页面的优先级** 。
-  - 这意味着后台应用的页面会更快地流向 LRU 的尾部并被释放，从而将宝贵的物理内存留给前台应用 。
+   ```bash
+   adb shell "su -c 'chmod 644 /data/local/tmp/vmlinux.btf'"
+   ```
 
-#### B. 轻量级预测回收 (Lightweight Prediction-based Reclaim, LWP)
+3. **拉取到 PC**： 将文件从手机传输到电脑当前工作目录。
 
-- **目标：** 解决回收粒度不匹配和直接回收频繁的问题 。
-- **机制：**
-  - **无锁滑动窗口预测器 (Lock-free Sliding Window Predictor):** 采样历史分配请求，预测未来的内存需求趋势 。
-  - **动态调整回收大小与水位：**
-    - 如果预测到未来会有大量 I/O 或内存需求，适当增加回收力度 。
-    - 根据预测结果动态调整 `watermark`（触发回收的阈值）和单次回收的页面数量（Reclaim Size），实现“按需回收”，避免过度回收造成抖动，或回收不足触发直接回收 。
+   ```bash
+   adb pull /data/local/tmp/vmlinux.btf .
+   ```
 
-### 4. 实验评估
+4. **清理现场**： 删除手机中的临时文件，保持环境整洁。
 
-研究团队在 Nexus 6P (Huawei P9 硬件规格) 上进行了实验，并在 52 台真实用户设备上收集了数据 。
+   ```bash
+   adb shell "rm /data/local/tmp/vmlinux.btf"
+   ```
 
-- **减少页面重错误：** 针对前台应用（如 AngryBirds），Acclaim 将页面重错误减少了 **16.3% 至 60.2%** 。
-- **减少直接回收：** 整个操作系统的直接回收次数减少了 **23.9% 至 70%** 。
-- **提升启动速度：** 在大多数测试用例中提升了应用冷启动速度，例如 CandyCrush 启动速度提升高达 **58.8%** 。
-- **I/O 性能提升：** 在高强度的写入测试（1GB 数据）中，写入性能提升了 **49.3%**，因为减少了分配内存时的阻塞 。
-- **开销极低：** 内存开销仅约 3MB（占 3GB RAM 的 0.1%），CPU 开销微乎其微 。
+#### 3. 生成 `vmlinux.h` 头文件
 
-### 5. 总结与局限性
+在 PC 上使用 `bpftool` 工具进行转换，[bpftool](https://github.com/libbpf/bpftool)需要提前在linux或WSL上安装。
 
-- **核心贡献：** 论文揭示了 Linux 服务器级内存回收策略在移动端的“水土不服”，并证明了通过区分前后台应用优先级以及基于负载预测调整回收粒度，可以显著提升 Android 的用户体验（启动速度、流畅度） 。
+```bash
+bpftool btf dump file vmlinux.btf format c > vmlinux.h
+```
 
-- **局限性（部分提及）：**
+#### 4. 编写内核态代码
 
-  - 如果前台和后台应用共享大量文件（如共享库），Acclaim 可能会误伤共享页面，导致轻微的性能损耗（如 Chrome 的启动延迟增加了 12.3%） 。
+​	 eBPF程序一般分为运行在内核空间的eBPF内核程序和运行在用户空间的eBPF加载程序。eBPF内核程序的代码文件后缀一般为 `.bpf.c` 
 
-  - 实现依赖于 PTE 中未使用的位，这在某些架构上可能受限 。
+​	根据实际需求找AI。注意在prompt中提及，“已生成vmlinux.h, 编写CO-RE eBPF程序。”
 
-    
+​	将内核态代码`.bpf.c`与`vmlinux.h`放在同一目录下。
 
-    
+编译内核态代码
+
+```bash
+# 使用 clang 编译，目标架构设为 arm64 (Android)
+clang -g -O2 -target bpf -D__TARGET_ARCH_arm64 -c [替换为真实文件名].bpf.c -o [替换为真实文件名].bpf.o
+```
+
+#### 6. 编写用户态加载器，编译
+
+​	下面2种方法任选其一。
+
+##### **（1）**使用 Makefile/CMake (C/libbpf) 交叉编译 Android eBPF 程序    *！！！依赖地狱警告*，不推荐
+
+##### （2）使用 Golang (cilium/ebpf) 开发      *！！！强烈推荐*
+
+- 要求已经安装Golang
+
+- 初始化
+
+  ```bash
+  mkdir -p [文件夹名称]
+  cd [文件夹名称]
+  # 把之前 clang 编译出来的 .o 文件拿过来
+  cp /path/to/[xxxx].bpf.o .
+  # 初始化go项目
+  go mod init [项目名称]
+  go get github.com/cilium/ebpf
+  ```
+
+- 编写用户态加载器
+
+  - 找AI帮忙
+
+- 交叉编译
+
+  ```bash
+  CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -o [替换为目标ELF文件名] main.go
+  ```
+
+- 推送并运行
+
+    ```shell
+    adb push [ELF程序名] /data/local/tmp/
+    adb shell
+    su
+    cd /data/local/tmp/
+    chmod +x [ELF程序名]
+    ./[ELF程序名]
+    ```
